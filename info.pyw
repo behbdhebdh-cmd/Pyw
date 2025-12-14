@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""System-Info (ohne externe Libraries) + optional Tkinter GUI
+"""System-Info (ohne externe Libraries) + optional Tkinter GUI oder Hintergrunddienst
 
 - Nutzt nur Python-Standardbibliothek.
 - Gibt Infos per print aus (CLI) oder zeigt sie in einer Tkinter-GUI an.
@@ -15,6 +15,8 @@ CLI Beispiele:
   python system_info.py --nojson
   python system_info.py --gui
   python system_info.py --selftest
+  python system_info.py --loop-selftest --loop-count 3
+  python system_info.py --background --interval 300 --logfile ~/system_info.log
 
 Hinweis zu "SystemExit: 0":
 - In echten CLI-Terminals ist das normal (Exit-Code 0 = Erfolg).
@@ -38,7 +40,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 def run_cmd(cmd: List[str], timeout: int = 10) -> Tuple[int, str, str]:
@@ -103,6 +105,58 @@ def get_local_ips() -> List[str]:
             seen.add(ip)
             uniq.append(ip)
     return uniq
+
+
+def get_uptime_seconds() -> Optional[float]:
+    """Return system uptime in seconds if available (best effort)."""
+
+    if hasattr(time, "clock_gettime") and hasattr(time, "CLOCK_BOOTTIME"):
+        try:
+            return float(time.clock_gettime(time.CLOCK_BOOTTIME))
+        except Exception:
+            pass
+
+    proc_uptime = Path("/proc/uptime")
+    if proc_uptime.exists():
+        try:
+            content = proc_uptime.read_text(encoding="utf-8", errors="ignore")
+            first = content.split()[0]
+            return float(first)
+        except Exception:
+            return None
+
+    return None
+
+
+def get_memory_info() -> Dict[str, Any]:
+    """Return total memory information using stdlib only (best effort)."""
+
+    total_bytes: Optional[int] = None
+    try:
+        pages = os.sysconf("SC_PHYS_PAGES")  # type: ignore[attr-defined]
+        page_size = os.sysconf("SC_PAGE_SIZE")  # type: ignore[attr-defined]
+        total_bytes = int(pages * page_size)
+    except Exception:
+        pass
+
+    return {"total_bytes": total_bytes}
+
+
+def get_storage_info(paths: Iterable[Path]) -> Dict[str, Any]:
+    """Collect disk usage info for given paths."""
+
+    info: Dict[str, Any] = {}
+    for p in paths:
+        try:
+            usage = shutil.disk_usage(p)
+            info[str(p)] = {
+                "total_bytes": usage.total,
+                "used_bytes": usage.used,
+                "free_bytes": usage.free,
+            }
+        except Exception as e:
+            info[str(p)] = {"error": str(e)}
+    return info
 
 
 def get_mac_address() -> Optional[str]:
@@ -413,6 +467,12 @@ def collect_info(include_public: bool = False) -> Dict[str, Any]:
             "machine": platform.machine(),
             "processor": platform.processor(),
         },
+        "hardware": {
+            "cpu_count": os.cpu_count(),
+            "uptime_seconds": get_uptime_seconds(),
+            "memory": get_memory_info(),
+            "storage": get_storage_info([Path.home(), Path("/")]),
+        },
         "python": {
             "version": sys.version.split()[0],
             "executable": sys.executable,
@@ -491,6 +551,70 @@ def _looks_like_notebook_or_ide() -> bool:
         return True
 
     return False
+
+
+def run_background_service(
+    *, include_public: bool, interval: int, logfile: Optional[Path]
+) -> int:
+    """Run a quiet background loop that periodically collects info.
+
+    The loop is cancelable via KeyboardInterrupt. Results are appended to
+    ``logfile`` as JSON lines when a path is provided.
+    """
+
+    if interval <= 0:
+        print("Intervall muss größer als 0 sein.")
+        return 2
+
+    stop_event = threading.Event()
+
+    def worker() -> None:
+        while not stop_event.is_set():
+            info = collect_info(include_public=include_public)
+            if logfile:
+                try:
+                    logfile.parent.mkdir(parents=True, exist_ok=True)
+                    with logfile.open("a", encoding="utf-8") as fh:
+                        fh.write(info_to_json_text(info))
+                        fh.write("\n")
+                except Exception as e:
+                    print(f"Konnte nicht in Logfile schreiben: {e}")
+            stop_event.wait(interval)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    destination = str(logfile) if logfile else "(kein Logfile)"
+    print(
+        f"Hintergrunddienst gestartet (Intervall {interval}s, Log: {destination})."
+    )
+    try:
+        while thread.is_alive():
+            thread.join(timeout=1.0)
+    except KeyboardInterrupt:
+        stop_event.set()
+        thread.join(timeout=5.0)
+        print("\nHintergrunddienst beendet (KeyboardInterrupt).")
+        return 130
+
+    return 0
+
+
+def run_looped_selftests(loop_count: int) -> int:
+    """Run selftests repeatedly to catch flaky issues."""
+
+    if loop_count <= 0:
+        print("Loop-Count muss größer als 0 sein.")
+        return 2
+
+    for idx in range(loop_count):
+        print(f"Selftest-Durchlauf {idx + 1}/{loop_count}...")
+        rc = run_selftests()
+        if rc != 0:
+            print(f"Selftests fehlgeschlagen im Durchlauf {idx + 1}.")
+            return rc
+    print("Alle Selftests erfolgreich abgeschlossen.")
+    return 0
 
 
 # --------------------------- GUI (Tkinter) ---------------------------
@@ -685,11 +809,47 @@ def main(argv: Optional[List[str]] = None) -> int:
         action="store_true",
         help="Führt kleine Selbsttests (unittest) aus und beendet sich danach.",
     )
+    ap.add_argument(
+        "--loop-selftest",
+        action="store_true",
+        help="Führt die Selbsttests mehrmals hintereinander aus.",
+    )
+    ap.add_argument(
+        "--loop-count",
+        type=int,
+        default=3,
+        help="Anzahl der Durchläufe für --loop-selftest (Standard: 3).",
+    )
+    ap.add_argument(
+        "--background",
+        action="store_true",
+        help="Startet einen Hintergrunddienst, der regelmäßig Informationen sammelt.",
+    )
+    ap.add_argument(
+        "--interval",
+        type=int,
+        default=300,
+        help="Intervall in Sekunden für den Hintergrunddienst (Standard: 300).",
+    )
+    ap.add_argument(
+        "--logfile",
+        type=Path,
+        default=None,
+        help="Optionaler Pfad für JSON-Log-Ausgaben im Hintergrunddienst.",
+    )
 
     args = ap.parse_args(argv)
 
     if args.selftest:
         return run_selftests()
+
+    if args.loop_selftest:
+        return run_looped_selftests(args.loop_count)
+
+    if args.background:
+        return run_background_service(
+            include_public=args.public, interval=args.interval, logfile=args.logfile
+        )
 
     if args.gui:
         return run_gui(default_public=args.public)
@@ -708,6 +868,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if info["identity"].get("computer_name"):
         print(f"Computername: {info['identity']['computer_name']}")
     print(f"User: {info['identity'].get('user')}")
+    hw = info.get("hardware", {})
+    print("CPU-Kerne:", hw.get("cpu_count"))
+    print("Uptime (s):", hw.get("uptime_seconds"))
+    mem = hw.get("memory", {}) if isinstance(hw, dict) else {}
+    print("RAM gesamt (Bytes):", mem.get("total_bytes"))
 
     print("\n=== Netzwerk ===")
     print("Local IPs:", ", ".join(info["network"].get("local_ips") or []) or "(none)")
